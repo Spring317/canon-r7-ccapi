@@ -18,6 +18,7 @@ Please note this only works for the models as documented at
 This includes:
 
 * EOS R6 Mark II,
+  EOS R8,
   EOS R7,	
   EOS R10,	
   EOS R3,
@@ -70,10 +71,23 @@ $ git clone https://github.com/laszewsk/canon-r7-ccapi.git
 $ cd canon-r7-ccapi
 $ pip install -e .
 $ export CANON_IP=<Your canon camera ip address>
+# Optional: Set the USB IP if you connect via USB (e.g. 192.168.1.1)
+$ export CANON_USB_IP=<Your canon camera usb ip address>
 $ make
 ```
 
 Those will install and run the program using a GUI.
+
+### Wired USB vs Wi-Fi Connection
+
+This application prioritizes a wired USB connection over a standard Wi-Fi connection. By connecting your camera via USB and configuring it for a "Smartphone connection" or similar network-over-USB mode, the camera will create a local network interface (such as RNDIS or NCM).
+
+**Benefits of a Wired USB Connection:**
+* **Lower Latency:** Commands are executed instantly compared to wireless delays.
+* **Higher Bandwidth & Reliability:** No interference from other Wi-Fi networks or dropped packets.
+* **Power Delivery:** If your USB port provides power, it reduces battery drain on the camera.
+
+The application automatically tests common USB IPs (like `192.168.1.1`, `192.168.42.1`, `192.168.225.1`) and checks the `CANON_USB_IP` environment variable before falling back to `CANON_IP` over Wi-Fi.
 
 Future:
 

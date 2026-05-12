@@ -15,6 +15,10 @@ setup(
         'watchdog',
         'ipywidgets',
         'requests',
+        'opencv-python',
+        'pandas',
+        'numpy',
+        'imutils',
     ],
     packages=find_packages(
         where='ccapi',  # '.' by default

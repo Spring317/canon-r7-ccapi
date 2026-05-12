@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import shutil
 import sys
 from datetime import datetime
@@ -46,21 +47,124 @@ class CCAPI:
     def __init__(self, ip=None, port=8080, debug=True, settings="canon-settings.json"):
         """
         Connects to the camera given the ip and port.
-        If the ip is not specified, it will be looked up from the
-        environmental variable CANON_IP.
+        Prioritizes a wired USB connection (e.g., over RNDIS/NCM interface)
+        before falling back to Wi-Fi. It will check CANON_USB_IP, then
+        common USB IPs, and finally CANON_IP or the provided ip.
 
         :param ip: The ip number in the form xxx.xxx.xxx.xxx
         :type ip: string
         :param port: The port number. Default is 8080
-        :type port: integare
+        :type port: integer
         """
         self.debug = debug
         self.settings_file = settings
-        if ip is None and os.environ["CANON_IP"]:
-            ip = os.environ["CANON_IP"]
-        self.ip = ip
         self.port = port
-        self.settings = self.get_settings()
+
+        # Build priority list of IPs to check
+        candidate_ips = []
+        if os.environ.get("CANON_USB_IP"):
+            candidate_ips.append(os.environ["CANON_USB_IP"])
+
+        # Common IPs assigned to USB network interfaces (Smartphone connection)
+        candidate_ips.extend(["192.168.1.1", "192.168.1.2", "192.168.42.1", "192.168.42.129", "192.168.225.1"])
+
+        if ip is not None:
+            candidate_ips.append(ip)
+        elif os.environ.get("CANON_IP"):
+            candidate_ips.append(os.environ.get("CANON_IP"))
+
+        self.ip = None
+        for test_ip in candidate_ips:
+            if self.debug:
+                print(f"Testing connection to IP: {test_ip}:{self.port} ...")
+            try:
+                # Use a short timeout to quickly skip unavailable IPs
+                resp = requests.get(f'http://{test_ip}:{self.port}/ccapi/ver100/deviceinformation', timeout=1.0)
+                if resp.status_code == 200:
+                    if self.debug:
+                        print(f"Successfully connected to CCAPI at {test_ip}.")
+                    self.ip = test_ip
+                    break
+            except requests.RequestException:
+                continue
+
+        if self.ip is None:
+            print("Warning: Could not establish CCAPI connection to any known IPs.")
+            # Default to the originally provided IP or CANON_IP if nothing worked
+            self.ip = ip if ip else os.environ.get("CANON_IP")
+
+        if self.ip:
+            self._init_endpoints()
+            self.settings = self.get_settings()
+        else:
+            self.endpoints = {}
+            self.settings = {}
+
+    def _init_endpoints(self):
+        """
+        Discovers all available CCAPI versions from the camera's root
+        /ccapi endpoint and builds a lookup table mapping each base path
+        (e.g. '/deviceinformation') to the highest available versioned
+        path (e.g. '/ccapi/ver140/deviceinformation').
+        """
+        self.endpoints = {}  # base_path -> highest versioned full path
+        self._api_versions = []  # sorted list of discovered versions
+        try:
+            r = requests.get(
+                f'http://{self.ip}:{self.port}/ccapi', timeout=3.0
+            )
+            data = r.json()
+            # data looks like: {"ver100": [{"path": "/ccapi/ver100/...", ...}, ...], "ver110": [...]}
+            # Sort version keys so we process lowest first; later (higher)
+            # versions overwrite earlier ones, leaving us with the highest.
+            versions = sorted(data.keys())
+            self._api_versions = versions
+            if self.debug:
+                print(f"Camera supports CCAPI versions: {versions}")
+            for ver in versions:
+                for entry in data[ver]:
+                    full_path = entry["path"]  # e.g. "/ccapi/ver110/devicestatus/storage"
+                    # Strip the /ccapi/verXXX prefix to get the base path
+                    base = re.sub(r'^/ccapi/ver\d+', '', full_path)
+                    self.endpoints[base] = full_path
+        except Exception as e:
+            if self.debug:
+                print(f"Warning: Could not discover CCAPI endpoints: {e}")
+            # Fallback: empty dict means _resolve_path will use ver100
+
+    def _resolve_path(self, path):
+        """
+        Resolves a path to the highest available CCAPI version.
+
+        Accepts paths in any of these forms:
+          - Already-versioned:  '/ccapi/ver100/deviceinformation'
+          - Base path only:     '/deviceinformation'
+          - Special:            '/ccapi'  (root discovery endpoint)
+
+        Returns the full versioned path, or falls back to ver100 if
+        the endpoint was not found during discovery.
+
+        :param path: The API path to resolve
+        :type path: string
+        :return: The resolved full path
+        :rtype: string
+        """
+        if path is None:
+            return path
+
+        # Don't touch the root discovery endpoint
+        if path == '/ccapi':
+            return path
+
+        # Strip an existing /ccapi/verXXX prefix to get the base path
+        base = re.sub(r'^/ccapi/ver\d+', '', path)
+
+        # Look up the highest version from our discovery table
+        if base in self.endpoints:
+            return self.endpoints[base]
+
+        # Fallback: if not found in discovery, use ver100
+        return f'/ccapi/ver100{base}'
 
     def gui(self, key=None):
         w = notebook_gui(self, key=key)
@@ -120,7 +224,7 @@ class CCAPI:
         :return: device information
         :rtype: dict
         """
-        r = self._get(path="/ccapi/ver100/deviceinformation").json()
+        r = self._get(path="/deviceinformation").json()
         return r
 
     def get_temperature(self):
@@ -130,7 +234,7 @@ class CCAPI:
         :return: temperature information
         :rtype: string
         """
-        r = self._get(path="/ccapi/ver100/devicestatus/temperature").json()
+        r = self._get(path="/devicestatus/temperature").json()
         return r
 
     @property
@@ -144,7 +248,7 @@ class CCAPI:
         :return: datetime information
         :rtype: string
         """
-        r = self._get(path="/ccapi/ver100/functions/datetime").json()
+        r = self._get(path="/functions/datetime").json()
         return r
 
     @property
@@ -161,7 +265,7 @@ class CCAPI:
         :return: the copyright information
         :rtype: string
         """
-        r = self._get(path="/ccapi/ver100/functions/registeredname/copyright").json()['copyright']
+        r = self._get(path="/functions/registeredname/copyright").json()['copyright']
         return r
 
     @copyright.setter
@@ -180,7 +284,7 @@ class CCAPI:
         :return: copyright information
         :rtype: string
         """
-        r = self._put(path="/ccapi/ver100/functions/registeredname/copyright",
+        r = self._put(path="/functions/registeredname/copyright",
                       json={"copyright": _copyright})
         return r
 
@@ -192,7 +296,7 @@ class CCAPI:
         :return: Author name as set in the camera
         :rtype: string
         """
-        r = self._get(path="/ccapi/ver100/functions/registeredname/author").json()['author']
+        r = self._get(path="/functions/registeredname/author").json()['author']
         return r
 
     @author.setter
@@ -205,7 +309,7 @@ class CCAPI:
         :return: None
         :rtype: None
         """
-        r = self._put(path="/ccapi/ver100/functions/registeredname/author",
+        r = self._put(path="/functions/registeredname/author",
                       json={"author": _author})
         return r
 
@@ -217,7 +321,7 @@ class CCAPI:
         :return: The owner information as set on the camera
         :rtype: string
         """
-        r = self._get(path="/ccapi/ver100/functions/registeredname/ownername").json()['ownername']
+        r = self._get(path="/functions/registeredname/ownername").json()['ownername']
         return r
 
     @owner.setter
@@ -230,7 +334,7 @@ class CCAPI:
         :return: None
         :rtype: None
         """
-        r = self._put(path="/ccapi/ver100/functions/registeredname/ownername",
+        r = self._put(path="/functions/registeredname/ownername",
                       json={"ownername": _owner})
         return r
 
@@ -242,7 +346,7 @@ class CCAPI:
         :return: The nickname
         :rtype: string
         """
-        r = self._get(path="/ccapi/ver100/functions/registeredname/nickname").json()['nickname']
+        r = self._get(path="/functions/registeredname/nickname").json()['nickname']
         return r
 
     @nickname.setter
@@ -255,20 +359,22 @@ class CCAPI:
         :return: None
         :rtype: None
         """
-        r = self._put(path="/ccapi/ver100/functions/registeredname/nickname",
+        r = self._put(path="/functions/registeredname/nickname",
                       json={"nickname": _nickname})
         return r
 
     def _get(self, path=None):
         """
-        Executes a GET on the path
+        Executes a GET on the path. The path is automatically resolved
+        to the highest available CCAPI version.
 
         :param path: The path
         :type path: string
         :return: response from the server
         :rtype:
         """
-        url = f'http://{self.ip}:{self.port}{path}'
+        resolved = self._resolve_path(path)
+        url = f'http://{self.ip}:{self.port}{resolved}'
         if self.debug:
             print(f"GET: {url}")
         r = requests.get(url)
@@ -276,7 +382,8 @@ class CCAPI:
 
     def _put(self, path=None, json=None):
         """
-        Executes a PUT on the path
+        Executes a PUT on the path. The path is automatically resolved
+        to the highest available CCAPI version.
 
         :param path: The path
         :type path: string
@@ -286,7 +393,8 @@ class CCAPI:
         :return: response from the server
         :rtype:
         """
-        url = f'http://{self.ip}:{self.port}{path}'
+        resolved = self._resolve_path(path)
+        url = f'http://{self.ip}:{self.port}{resolved}'
         if self.debug:
             print(f"PUT: {url} <- {json}")
         r = requests.put(url, json=json)
@@ -294,7 +402,8 @@ class CCAPI:
 
     def _post(self, path=None, json=None):
         """
-        Executes a POST on the path
+        Executes a POST on the path. The path is automatically resolved
+        to the highest available CCAPI version.
 
         :param path:
         :type path:
@@ -303,7 +412,8 @@ class CCAPI:
         :return:
         :rtype:
         """
-        url = f'http://{self.ip}:{self.port}{path}'
+        resolved = self._resolve_path(path)
+        url = f'http://{self.ip}:{self.port}{resolved}'
         if self.debug:
             print(f"POST: {url} <- {json}")
         r = requests.post(url, json=json)
@@ -350,7 +460,7 @@ class CCAPI:
         :return:
         :rtype:
         """
-        r = self._get(path="/ccapi/ver100/devicestatus/lens").json()
+        r = self._get(path="/devicestatus/lens").json()
         return r
 
     def get_storage(self):
@@ -360,7 +470,7 @@ class CCAPI:
         :return:
         :rtype:
         """
-        r = self._get(path="/ccapi/ver110/devicestatus/storage").json()["storagelist"]
+        r = self._get(path="/devicestatus/storage").json()["storagelist"]
         for entry in r:
             entry["maxsize"] = humanize.naturalsize(entry["maxsize"])
             entry["spacesize"] = humanize.naturalsize(entry["spacesize"])
@@ -388,14 +498,9 @@ class CCAPI:
         :return:
         :rtype:
         """
-        # /ccapi/ver100/devicestatus/battery
-        # /ccapi/ver110/devicestatus/batterylist
-
-        # for R7 we have one battery
-
-        # The ver100 call needs to be done first to get accurate level information
-        no_percent = self._get(path="/ccapi/ver100/devicestatus/battery")
-        result = self._get(path="/ccapi/ver110/devicestatus/batterylist")
+        # The battery call needs to be done first to get accurate level information
+        no_percent = self._get(path="/devicestatus/battery")
+        result = self._get(path="/devicestatus/batterylist")
         r = result.json()["batterylist"][0]
         if output in ["json", None]:
             return r
@@ -405,7 +510,9 @@ class CCAPI:
 
     def get_settings(self, refresh=True):
         """
-        Gets the current settings from the camera
+        Gets the current settings from the camera.
+        Dynamically queries all discovered CCAPI versions for their
+        shooting settings.
 
         :return:
         :rtype:
@@ -414,10 +521,19 @@ class CCAPI:
             with open(self.settings_file, "r") as file:
                 c = json.load(file)
         else:
-            self.settings = {
-                "ver110": self._get(path="/ccapi/ver110/shooting/settings").json(),
-                "ver100": self._get(path="/ccapi/ver100/shooting/settings").json()
-            }
+            # Dynamically query settings from all discovered versions
+            self.settings = {}
+            versions_to_query = self._api_versions if self._api_versions else ["ver100", "ver110"]
+            for ver in versions_to_query:
+                try:
+                    settings_data = self._get(path=f"/ccapi/{ver}/shooting/settings").json()
+                    if settings_data:  # only add if the camera returned data
+                        self.settings[ver] = settings_data
+                except Exception:
+                    pass  # version may not have shooting/settings
+            # Ensure at least empty dicts so downstream code doesn't break
+            if not self.settings:
+                self.settings = {"ver100": {}}
 
             for version in self.settings:
                 for key in self.settings[version]:
@@ -455,7 +571,7 @@ class CCAPI:
         :rtype:
         """
 
-        cards = self._get(path="/ccapi/ver110/contents").json()["path"]
+        cards = self._get(path="/contents").json()["path"]
         images = []
         for path in cards:
             directories = self._get(path=path).json()["path"]
@@ -478,18 +594,18 @@ class CCAPI:
         :return:
         :rtype:
         """
-        r = self._get(path="/ccapi/ver100/shooting/settings/focusbracketing/exposuresmoothing").json()
+        r = self._get(path="/shooting/settings/focusbracketing/exposuresmoothing").json()
         return r
 
     @exposuresmoothing.setter
     def exposuresmoothing(self, on):
         value = self._get_enable(on)
-        r = self._put(path="/ccapi/ver100/shooting/settings/focusbracketing/exposuresmoothing",
+        r = self._put(path="/shooting/settings/focusbracketing/exposuresmoothing",
                       json={"value": value})
         return r
 
     def get_numberofshots(self):
-        r = self._get(path="/ccapi/ver100/shooting/settings/focusbracketing/numberofshots").json()
+        r = self._get(path="/shooting/settings/focusbracketing/numberofshots").json()
         return r
 
     @property
@@ -501,12 +617,12 @@ class CCAPI:
     def numberofshots(self, n):
         ability = self.get_numberofshots()["ability"]
         if ability["min"] <= n <= ability["max"]:
-            r = self._put(path="/ccapi/ver100/shooting/settings/focusbracketing/numberofshots",
+            r = self._put(path="/shooting/settings/focusbracketing/numberofshots",
                           json={"value": n})
         return r
 
     def get_focusincrement(self):
-        r = self._get(path="/ccapi/ver100/shooting/settings/focusbracketing/focusincrement").json()
+        r = self._get(path="/shooting/settings/focusbracketing/focusincrement").json()
         return r
 
     @property
@@ -518,7 +634,7 @@ class CCAPI:
     def focusincrement(self, n):
         ability = self.get_focusincrement()["ability"]
         if ability["min"] <= n <= ability["max"]:
-            r = self._put(path="/ccapi/ver100/shooting/settings/focusbracketing/focusincrement",
+            r = self._put(path="/shooting/settings/focusbracketing/focusincrement",
                           json={"value": n})
         return r
 
@@ -540,13 +656,13 @@ class CCAPI:
 
     @property
     def focusbracketing(self):
-        r = self._get(path="/ccapi/ver100/shooting/settings/focusbracketing").json()
+        r = self._get(path="/shooting/settings/focusbracketing").json()
         return r
 
     @focusbracketing.setter
     def focusbracketing(self, on):
         value = self._get_enable(on)
-        r = self._put(path="/ccapi/ver100/shooting/settings/focusbracketing",
+        r = self._put(path="/shooting/settings/focusbracketing",
                       json={"value": value})
         return r
 
@@ -558,14 +674,14 @@ class CCAPI:
             print("error setting size")
             return None
 
-        r = self._post(path="/ccapi/ver100/shooting/liveview",
+        r = self._post(path="/shooting/liveview",
                        json={"cameradisplay": display,
                              "liveviewsize": size
                              })
 
         return r
 
-    cam = "/ccapi/ver100/shooting/liveview/rtp"
+    cam = "/shooting/liveview/rtp"
 
     def cam_start(self):
         r = self._post(path=self.cam,
@@ -649,7 +765,7 @@ class CCAPI:
         :return:
         :rtype:
         """
-        url = f"http://192.168.50.210:8080{image}"
+        url = f"http://{self.ip}:{self.port}{image}"
 
         name = os.path.basename(url)
         if self.debug:
@@ -671,8 +787,8 @@ class CCAPI:
         :rtype:
         """
 
-        url = "http://192.168.50.210:8080/ccapi/ver100/shooting/liveview/flipdetail?kind=image"
-        url = "http://192.168.50.210:8080/ccapi/ver100/shooting/liveview/flip"
+        url = f"http://{self.ip}:{self.port}{self._resolve_path('/shooting/liveview/flipdetail')}?kind=image"
+        url = f"http://{self.ip}:{self.port}{self._resolve_path('/shooting/liveview/flip')}"
 
         response = requests.get(url, stream=True)
         with open(name, 'wb') as out_file:
@@ -694,12 +810,12 @@ class CCAPI:
 
     def get_zoom(self):
         # only supported for PowerShot cameras
-        r = self._get(path="/ccapi/ver100/shooting/control/zoom")
+        r = self._get(path="/shooting/control/zoom")
         return r
 
     def get_shootingmodedial(self):
         # only supported for PowerShot cameras
-        r = self._get(path="/ccapi/ver100/shooting/settings/shootingmodedial").json()
+        r = self._get(path="/shooting/settings/shootingmodedial").json()
         return r
 
     @property
@@ -732,7 +848,7 @@ class CCAPI:
         :return:
         :rtype:
         """
-        r = self._get(path="/ccapi/ver100/functions/autopoweroff").json()
+        r = self._get(path="/functions/autopoweroff").json()
         return r
 
     @property
@@ -742,7 +858,7 @@ class CCAPI:
 
     @autopoweroff.setter
     def autopoweroff(self, value):
-        r = self.set_value(path="/ccapi/ver100/functions/autopoweroff",
+        r = self.set_value(path="/functions/autopoweroff",
                            value=value)
         return r
 
@@ -752,7 +868,7 @@ class CCAPI:
             action = "start"
         else:
             action = "stop"
-        r = self._post(path="/ccapi/ver100/shooting/control/af",
+        r = self._post(path="/shooting/control/af",
                        json={
                            "action": action
                        })
@@ -764,7 +880,7 @@ class CCAPI:
             action = "start"
         else:
             action = "stop"
-        r = self._post(path="/ccapi/ver100/shooting/control/flickerdetection",
+        r = self._post(path="/shooting/control/flickerdetection",
                        json={
                            "action": action
                        })
@@ -772,7 +888,7 @@ class CCAPI:
 
     def shoot(self, af=True):
         af = self._get_bool(af)
-        r = self._post(path="/ccapi/ver100/shooting/control/shutterbutton",
+        r = self._post(path="/shooting/control/shutterbutton",
                        json={
                            "af": af
                        })
@@ -782,7 +898,7 @@ class CCAPI:
         af = self._get_bool(af)
         if action not in ["full_press", "half_press", "release"]:
             return
-        r = self._post(path="/ccapi/ver100/shooting/control/shutterbutton/manual",
+        r = self._post(path="/shooting/control/shutterbutton/manual",
                        json={
                            "af": af,
                            "action": action
@@ -812,15 +928,17 @@ class CCAPI:
         return result
 
     def get_settings_version(self, key=None):
-        ver100 = self.settings["ver100"].keys()
-        ver110 = self.settings["ver110"].keys()
-        version = "ver110"
-
-        if key in ver110:
-            version = "ver110"
-        if key in ver100:
-            version = "ver100"
-        return version
+        """
+        Determines which CCAPI version contains a given settings key.
+        Searches all discovered versions, preferring the highest version
+        that has the key (to leverage the latest API).
+        """
+        # Search from highest version to lowest; return first match
+        for ver in sorted(self.settings.keys(), reverse=True):
+            if key in self.settings[ver]:
+                return ver
+        # Fallback to first available version
+        return sorted(self.settings.keys())[0] if self.settings else "ver100"
 
     def get_settings_value(self, key=None):
         version = self.get_settings_version(key=key)
@@ -829,9 +947,8 @@ class CCAPI:
 
     @property
     def beep(self):
-        version = "ver100"
         key = "beep"
-        r = self._get(path=f"/ccapi/{version}/functions/{key}").json()["value"]
+        r = self._get(path=f"/functions/{key}").json()["value"]
         return r
 
     # @beep.setter
